@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_interface::{
-    self, Mint, MintTo, TokenAccount, TokenInterface, TransferChecked,
+    self, Burn, Mint, MintTo, TokenAccount, TokenInterface, TransferChecked,
 };
 
 declare_id!("C9pH3cWmgQihD2xPQgWxsb7QyWkNpXQNPxsCBkVJrQM1");
@@ -100,6 +100,76 @@ pub mod liquidity_vault {
             .ok_or(VaultError::MathOverflow)?;
 
         msg!("Deposited {} tokens, minted {} shares", amount, shares);
+        Ok(())
+    }
+    /// Неделя 10: пользователь возвращает share-токены и забирает свою долю.
+    pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
+        require!(shares > 0, VaultError::ZeroAmount);
+        let user_shares = ctx.accounts.user_share.amount;
+        require!(shares <= user_shares, VaultError::InsufficientShares);
+
+        let share_supply = ctx.accounts.share_mint.supply;
+        let total_assets = ctx.accounts.vault_token.amount;
+
+        // Сколько токенов положено: shares / все share * всё, что лежит в vault
+        let amount_out = u64::try_from(
+            (shares as u128)
+                .checked_mul(total_assets as u128)
+                .ok_or(VaultError::MathOverflow)?
+                / (share_supply as u128),
+        )
+        .map_err(|_| VaultError::MathOverflow)?;
+        require!(amount_out > 0, VaultError::NothingToWithdraw);
+
+        // Какая часть первоначального вклада выводится (для учёта)
+        let principal_out = u64::try_from(
+            (ctx.accounts.position.deposited as u128)
+                .checked_mul(shares as u128)
+                .ok_or(VaultError::MathOverflow)?
+                / (user_shares as u128),
+        )
+        .map_err(|_| VaultError::MathOverflow)?;
+
+        // 1. CPI: сжигаем share-токены (подписывает пользователь)
+        let burn_accounts = Burn {
+            mint: ctx.accounts.share_mint.to_account_info(),
+            from: ctx.accounts.user_share.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+        };
+        let burn_ctx = CpiContext::new(ctx.accounts.token_program.key(), burn_accounts);
+        token_interface::burn(burn_ctx, shares)?;
+
+        // 2. CPI: токены из хранилища пользователю (подписывает программа от имени PDA vault)
+        let deposit_mint_key = ctx.accounts.vault.deposit_mint;
+        let bump = [ctx.accounts.vault.bump];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"vault", deposit_mint_key.as_ref(), &bump]];
+        let transfer_accounts = TransferChecked {
+            from: ctx.accounts.vault_token.to_account_info(),
+            mint: ctx.accounts.deposit_mint.to_account_info(),
+            to: ctx.accounts.user_token.to_account_info(),
+            authority: ctx.accounts.vault.to_account_info(),
+        };
+        let transfer_ctx = CpiContext::new(ctx.accounts.token_program.key(), transfer_accounts)
+            .with_signer(signer_seeds);
+        token_interface::transfer_checked(
+            transfer_ctx,
+            amount_out,
+            ctx.accounts.deposit_mint.decimals,
+        )?;
+
+        // 3. Обновляем учёт
+        let vault = &mut ctx.accounts.vault;
+        vault.total_deposited = vault
+            .total_deposited
+            .checked_sub(principal_out)
+            .ok_or(VaultError::MathOverflow)?;
+        let position = &mut ctx.accounts.position;
+        position.deposited = position
+            .deposited
+            .checked_sub(principal_out)
+            .ok_or(VaultError::MathOverflow)?;
+
+        msg!("Burned {} shares, withdrew {} tokens", shares, amount_out);
         Ok(())
     }
 }
@@ -224,6 +294,55 @@ pub struct Deposit<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", vault.deposit_mint.as_ref()],
+        bump = vault.bump,
+        has_one = deposit_mint,
+        has_one = share_mint,
+        has_one = vault_token
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+
+    pub deposit_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    #[account(mut)]
+    pub share_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    #[account(mut)]
+    pub vault_token: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        token::mint = deposit_mint,
+        token::authority = user,
+        token::token_program = token_program
+    )]
+    pub user_token: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        token::mint = share_mint,
+        token::authority = user,
+        token::token_program = token_program
+    )]
+    pub user_share: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [b"position", vault.key().as_ref(), user.key().as_ref()],
+        bump = position.bump
+    )]
+    pub position: Box<Account<'info, UserPosition>>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
 #[account]
 #[derive(InitSpace)]
 pub struct Vault {
@@ -254,4 +373,8 @@ pub enum VaultError {
     EmptyVault,
     #[msg("Math overflow")]
     MathOverflow,
+    #[msg("Not enough share tokens")]
+    InsufficientShares,
+    #[msg("Withdrawal amount is zero")]
+    NothingToWithdraw,
 }

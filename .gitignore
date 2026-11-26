@@ -6,3 +6,12 @@ node_modules
 test-ledger
 .yarn
 .surfpool
+
+# Wallets and private keys
+.env
+.env.local
+id.json
+*-keypair.json
+week13-trader.json
+*.bak
+node_modules/

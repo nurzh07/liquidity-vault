@@ -1,0 +1,27 @@
+{
+  "name": "raydium_clmm",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@anchor-lang/core": "^1.2.2",
+    "@raydium-io/raydium-sdk-v2": "^0.2.84-alpha",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0",
+    "bn.js": "^5.2.5",
+    "decimal.js": "^10.6.0"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.2.0",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

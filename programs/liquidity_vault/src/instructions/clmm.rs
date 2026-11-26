@@ -32,13 +32,18 @@ pub fn open_position_data(
     let mut data = Vec::new();
 
     data.extend_from_slice(&OPEN_POSITION_V2);
-    data.extend_from_slice(&liquidity.to_le_bytes());
-    data.extend_from_slice(&amount_0_max.to_le_bytes());
-    data.extend_from_slice(&amount_1_max.to_le_bytes());
+
     data.extend_from_slice(&tick_lower.to_le_bytes());
     data.extend_from_slice(&tick_upper.to_le_bytes());
+
     data.extend_from_slice(&tick_array_lower.to_le_bytes());
+
     data.extend_from_slice(&tick_array_upper.to_le_bytes());
+
+    data.extend_from_slice(&liquidity.to_le_bytes());
+
+    data.extend_from_slice(&amount_0_max.to_le_bytes());
+    data.extend_from_slice(&amount_1_max.to_le_bytes());
 
     data.push(0); // with_metadata = false
     data.push(0); // base_flag = None

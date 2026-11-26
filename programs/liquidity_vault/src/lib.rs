@@ -15,16 +15,288 @@ declare_id!("C9pH3cWmgQihD2xPQgWxsb7QyWkNpXQNPxsCBkVJrQM1");
 /// Программа Raydium CLMM в DEVNET (официальная таблица адресов Raydium):
 /// DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH
 pub const CLMM_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-    184, 152, 151, 52, 252, 179, 140, 145, 104, 216, 83, 199, 83, 182, 184, 164,
-    54, 16, 205, 211, 37, 175, 187, 199, 47, 212, 21, 54, 219, 205, 194, 88,
+    184, 152, 151, 52, 252, 179, 140, 145, 104, 216, 83, 199, 83, 182, 184, 164, 54, 16, 205, 211,
+    37, 175, 187, 199, 47, 212, 21, 54, 219, 205, 194, 88,
 ]);
 
 /// Идентификатор инструкции swap_v2 в CLMM (первые 8 байт sha256 от "global:swap_v2")
 pub const SWAP_V2_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
 
+fn ensure_vault_idle(position: &AccountInfo, token_b: &AccountInfo) -> Result<()> {
+    if !position.data_is_empty() {
+        require_keys_eq!(*position.owner, crate::ID, VaultError::InvalidClmmAccount);
+
+        let data = position.try_borrow_data()?;
+        let mut bytes: &[u8] = &data;
+
+        let state = instructions::clmm::ClmmPosition::try_deserialize(&mut bytes)?;
+
+        require!(!state.active, VaultError::ClmmPositionActive);
+    }
+
+    if !token_b.data_is_empty() {
+        require!(
+            token_b.owner == &anchor_spl::token::ID || token_b.owner == &anchor_spl::token_2022::ID,
+            VaultError::InvalidClmmAccount
+        );
+
+        let data = token_b.try_borrow_data()?;
+        let mut bytes: &[u8] = &data;
+        let account = TokenAccount::try_deserialize(&mut bytes)?;
+
+        require!(account.amount == 0, VaultError::TokenBNotEmpty);
+    }
+
+    Ok(())
+}
+
 #[program]
 pub mod liquidity_vault {
     use super::*;
+
+    pub fn collect_fees(ctx: Context<ManageClmmPosition>) -> Result<()> {
+        let a = ctx.accounts;
+
+        require!(a.clmm_position.active, VaultError::ClmmNotActive);
+
+        decrease_clmm_position(a, 0, 0, 0)?;
+
+        msg!("CLMM fees collected");
+
+        Ok(())
+    }
+
+    pub fn close_clmm_position(
+        ctx: Context<ManageClmmPosition>,
+        amount_0_min: u64,
+        amount_1_min: u64,
+    ) -> Result<()> {
+        use crate::instructions::clmm::*;
+
+        let a = ctx.accounts;
+
+        require!(a.clmm_position.active, VaultError::ClmmNotActive);
+
+        let liquidity = a.clmm_position.liquidity;
+
+        decrease_clmm_position(a, liquidity, amount_0_min, amount_1_min)?;
+
+        let mint = a.vault.deposit_mint;
+        let bump = [a.vault.bump];
+
+        let seeds: &[&[&[u8]]] = &[&[b"vault", mint.as_ref(), &bump]];
+
+        let infos = vec![
+            a.vault.to_account_info(),
+            a.nft_mint.to_account_info(),
+            a.nft_account.to_account_info(),
+            a.personal_position.to_account_info(),
+            a.system_program.to_account_info(),
+            a.token_program.to_account_info(),
+        ];
+
+        let metas = vec![
+            AccountMeta::new(a.vault.key(), true),
+            AccountMeta::new(a.nft_mint.key(), false),
+            AccountMeta::new(a.nft_account.key(), false),
+            AccountMeta::new(a.personal_position.key(), false),
+            AccountMeta::new_readonly(a.system_program.key(), false),
+            AccountMeta::new_readonly(a.token_program.key(), false),
+        ];
+
+        invoke_clmm(
+            a.clmm_program.to_account_info(),
+            &infos,
+            metas,
+            close_position_data(),
+            seeds,
+        )?;
+
+        a.clmm_position.active = false;
+        a.clmm_position.liquidity = 0;
+
+        msg!("CLMM position closed");
+
+        Ok(())
+    }
+
+    pub fn open_clmm_position(
+        mut ctx: Context<OpenClmmPosition>,
+        liquidity: u128,
+        amount_0_max: u64,
+        amount_1_max: u64,
+        tick_lower: i32,
+        tick_upper: i32,
+        tick_array_lower_start: i32,
+        tick_array_upper_start: i32,
+    ) -> Result<()> {
+        use crate::instructions::clmm::*;
+
+        let a = &mut ctx.accounts;
+
+        require!(!a.clmm_position.active, VaultError::ClmmAlreadyActive);
+
+        require!(liquidity > 0, VaultError::ZeroAmount);
+
+        require!(tick_lower < tick_upper, VaultError::InvalidTickRange);
+
+        let mint = a.vault.deposit_mint;
+        let bump = [a.vault.bump];
+
+        let seeds: &[&[&[u8]]] = &[&[b"vault", mint.as_ref(), &bump]];
+
+        let vault_info = a.vault.to_account_info();
+
+        let (token_0, token_1) = if a.vault_token.mint == a.mint_0.key() {
+            (&a.vault_token, &a.vault_token_b)
+        } else {
+            (&a.vault_token_b, &a.vault_token)
+        };
+
+        require_keys_eq!(token_0.mint, a.mint_0.key());
+        require_keys_eq!(token_1.mint, a.mint_1.key());
+
+        require!(
+            token_0.amount >= amount_0_max,
+            VaultError::InsufficientVaultBalance
+        );
+
+        require!(
+            token_1.amount >= amount_1_max,
+            VaultError::InsufficientVaultBalance
+        );
+
+        let before_0 = token_0.amount;
+        let before_1 = token_1.amount;
+
+        let token_0_info = token_0.to_account_info();
+        let token_1_info = token_1.to_account_info();
+
+        approve_tokens(
+            a.token_program.to_account_info(),
+            token_0_info.clone(),
+            a.admin.to_account_info(),
+            vault_info.clone(),
+            amount_0_max,
+            seeds,
+        )?;
+
+        approve_tokens(
+            a.token_program.to_account_info(),
+            token_1_info.clone(),
+            a.admin.to_account_info(),
+            vault_info.clone(),
+            amount_1_max,
+            seeds,
+        )?;
+
+        let infos = vec![
+            a.admin.to_account_info(),
+            vault_info.clone(),
+            a.nft_mint.to_account_info(),
+            a.nft_account.to_account_info(),
+            a.metadata_account.to_account_info(),
+            a.pool_state.to_account_info(),
+            a.protocol_position.to_account_info(),
+            a.tick_array_lower.to_account_info(),
+            a.tick_array_upper.to_account_info(),
+            a.personal_position.to_account_info(),
+            token_0_info.clone(),
+            token_1_info.clone(),
+            a.pool_vault_0.to_account_info(),
+            a.pool_vault_1.to_account_info(),
+            a.rent.to_account_info(),
+            a.system_program.to_account_info(),
+            a.token_program.to_account_info(),
+            a.associated_token_program.to_account_info(),
+            a.metadata_program.to_account_info(),
+            a.token_program_2022.to_account_info(),
+            a.mint_0.to_account_info(),
+            a.mint_1.to_account_info(),
+            a.bitmap_extension.to_account_info(),
+        ];
+
+        let writable = [0usize, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 22];
+
+        let metas = infos
+            .iter()
+            .enumerate()
+            .map(|(i, account)| {
+                let signer = i == 0 || i == 2;
+
+                if writable.contains(&i) {
+                    AccountMeta::new(account.key(), signer)
+                } else {
+                    AccountMeta::new_readonly(account.key(), signer)
+                }
+            })
+            .collect();
+
+        let data = open_position_data(
+            liquidity,
+            amount_0_max,
+            amount_1_max,
+            tick_lower,
+            tick_upper,
+            tick_array_lower_start,
+            tick_array_upper_start,
+        );
+
+        invoke_clmm(a.clmm_program.to_account_info(), &infos, metas, data, seeds)?;
+
+        revoke_tokens(
+            a.token_program.to_account_info(),
+            token_0_info.clone(),
+            vault_info.clone(),
+            seeds,
+        )?;
+
+        revoke_tokens(
+            a.token_program.to_account_info(),
+            token_1_info.clone(),
+            vault_info,
+            seeds,
+        )?;
+
+        let after_0 =
+            TokenAccount::try_deserialize(&mut &token_0_info.try_borrow_data()?[..])?.amount;
+
+        let after_1 =
+            TokenAccount::try_deserialize(&mut &token_1_info.try_borrow_data()?[..])?.amount;
+
+        let spent_0 = before_0
+            .checked_sub(after_0)
+            .ok_or(VaultError::MathOverflow)?;
+
+        let spent_1 = before_1
+            .checked_sub(after_1)
+            .ok_or(VaultError::MathOverflow)?;
+
+        require!(
+            spent_0 <= amount_0_max && spent_1 <= amount_1_max,
+            VaultError::SlippageExceeded
+        );
+
+        let position = &mut a.clmm_position;
+
+        position.vault = a.vault.key();
+        position.pool = a.pool_state.key();
+        position.nft_mint = a.nft_mint.key();
+        position.personal_position = a.personal_position.key();
+
+        position.tick_lower = tick_lower;
+        position.tick_upper = tick_upper;
+        position.liquidity = liquidity;
+        position.active = true;
+        position.bump = ctx.bumps.clmm_position;
+
+        msg!("CLMM position opened");
+        msg!("Liquidity: {}", liquidity);
+        msg!("Token 0 spent: {}", spent_0);
+        msg!("Token 1 spent: {}", spent_1);
+
+        Ok(())
+    }
 
     /// Неделя 8: создаёт vault, share-токен и хранилище токенов.
     pub fn initialize_vault(ctx: Context<InitializeVault>) -> Result<()> {
@@ -52,6 +324,11 @@ pub mod liquidity_vault {
 
     /// Неделя 9: пользователь вносит токены и получает share-токены.
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        ensure_vault_idle(
+            &ctx.accounts.clmm_position.to_account_info(),
+            &ctx.accounts.vault_token_b.to_account_info(),
+        )?;
+
         require!(amount > 0, VaultError::ZeroAmount);
 
         let share_supply = ctx.accounts.share_mint.supply;
@@ -76,8 +353,7 @@ pub mod liquidity_vault {
             to: ctx.accounts.vault_token.to_account_info(),
             authority: ctx.accounts.user.to_account_info(),
         };
-        let transfer_ctx =
-            CpiContext::new(ctx.accounts.token_program.key(), transfer_accounts);
+        let transfer_ctx = CpiContext::new(ctx.accounts.token_program.key(), transfer_accounts);
         token_interface::transfer_checked(
             transfer_ctx,
             amount,
@@ -116,6 +392,11 @@ pub mod liquidity_vault {
 
     /// Неделя 10: пользователь возвращает share-токены и забирает свою долю.
     pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()> {
+        ensure_vault_idle(
+            &ctx.accounts.clmm_position.to_account_info(),
+            &ctx.accounts.vault_token_b.to_account_info(),
+        )?;
+
         require!(shares > 0, VaultError::ZeroAmount);
         let user_shares = ctx.accounts.user_share.amount;
         require!(shares <= user_shares, VaultError::InsufficientShares);
@@ -186,7 +467,10 @@ pub mod liquidity_vault {
 
     /// Неделя 12: администратор создаёт хранилище для второго токена (токен B).
     pub fn init_token_b(ctx: Context<InitTokenB>) -> Result<()> {
-        msg!("Vault token B created: {}", ctx.accounts.vault_token_b.key());
+        msg!(
+            "Vault token B created: {}",
+            ctx.accounts.vault_token_b.key()
+        );
         Ok(())
     }
 
@@ -206,7 +490,10 @@ pub mod liquidity_vault {
         } else {
             ctx.accounts.vault_token_b.amount
         };
-        require!(in_balance >= amount_in, VaultError::InsufficientVaultBalance);
+        require!(
+            in_balance >= amount_in,
+            VaultError::InsufficientVaultBalance
+        );
         let out_before = if a_to_b {
             ctx.accounts.vault_token_b.amount
         } else {
@@ -221,9 +508,19 @@ pub mod liquidity_vault {
         {
             let a = &ctx.accounts;
             let (input_token, output_token, input_mint, output_mint) = if a_to_b {
-                (&a.vault_token, &a.vault_token_b, &a.deposit_mint, &a.token_b_mint)
+                (
+                    &a.vault_token,
+                    &a.vault_token_b,
+                    &a.deposit_mint,
+                    &a.token_b_mint,
+                )
             } else {
-                (&a.vault_token_b, &a.vault_token, &a.token_b_mint, &a.deposit_mint)
+                (
+                    &a.vault_token_b,
+                    &a.vault_token,
+                    &a.token_b_mint,
+                    &a.deposit_mint,
+                )
             };
 
             // Данные инструкции swap_v2 формирует сама программа (41 байт)
@@ -412,6 +709,20 @@ pub struct Deposit<'info> {
     )]
     pub position: Box<Account<'info, UserPosition>>,
 
+    /// CHECK: Canonical CLMM position PDA.
+    #[account(
+        seeds = [b"clmm_position", vault.key().as_ref()],
+        bump
+    )]
+    pub clmm_position: UncheckedAccount<'info>,
+
+    /// CHECK: Canonical token B vault PDA.
+    #[account(
+        seeds = [b"vault_token_b", vault.key().as_ref()],
+        bump
+    )]
+    pub vault_token_b: UncheckedAccount<'info>,
+
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -462,6 +773,20 @@ pub struct Withdraw<'info> {
         bump = position.bump
     )]
     pub position: Box<Account<'info, UserPosition>>,
+
+    /// CHECK: Canonical CLMM position PDA.
+    #[account(
+        seeds = [b"clmm_position", vault.key().as_ref()],
+        bump
+    )]
+    pub clmm_position: UncheckedAccount<'info>,
+
+    /// CHECK: Canonical token B vault PDA.
+    #[account(
+        seeds = [b"vault_token_b", vault.key().as_ref()],
+        bump
+    )]
+    pub vault_token_b: UncheckedAccount<'info>,
 
     pub token_program: Interface<'info, TokenInterface>,
 }
@@ -585,6 +910,24 @@ pub struct UserPosition {
 
 #[error_code]
 pub enum VaultError {
+    #[msg("CLMM position is already active")]
+    ClmmAlreadyActive,
+
+    #[msg("CLMM position is not active")]
+    ClmmNotActive,
+
+    #[msg("Invalid CLMM tick range")]
+    InvalidTickRange,
+
+    #[msg("Invalid CLMM account")]
+    InvalidClmmAccount,
+
+    #[msg("Close CLMM position before deposit or withdrawal")]
+    ClmmPositionActive,
+
+    #[msg("Convert token B back to token A first")]
+    TokenBNotEmpty,
+
     #[msg("Deposit amount must be greater than zero")]
     ZeroAmount,
     #[msg("Deposit is too small: zero shares would be minted")]
@@ -605,4 +948,308 @@ pub enum VaultError {
     InsufficientVaultBalance,
     #[msg("Swap output is below the minimum (slippage)")]
     SlippageExceeded,
+}
+
+#[derive(Accounts)]
+pub struct OpenClmmPosition<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [b"vault", vault.deposit_mint.as_ref()],
+        bump = vault.bump,
+        has_one = admin @ VaultError::NotAdmin,
+        has_one = vault_token
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+
+    #[account(
+        init_if_needed,
+        payer = admin,
+        space = 8 + instructions::clmm::ClmmPosition::INIT_SPACE,
+        seeds = [b"clmm_position", vault.key().as_ref()],
+        bump
+    )]
+    pub clmm_position: Box<Account<'info, instructions::clmm::ClmmPosition>>,
+
+    #[account(
+        mut,
+        token::authority = vault,
+        token::token_program = token_program
+    )]
+    pub vault_token: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [b"vault_token_b", vault.key().as_ref()],
+        bump,
+        token::authority = vault,
+        token::token_program = token_program
+    )]
+    pub vault_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(mut)]
+    pub nft_mint: Signer<'info>,
+
+    /// CHECK: Raydium validates NFT ATA.
+    #[account(mut)]
+    pub nft_account: UncheckedAccount<'info>,
+
+    /// CHECK: Raydium metadata account.
+    #[account(mut)]
+    pub metadata_account: UncheckedAccount<'info>,
+
+    /// CHECK: Raydium validates pool state.
+    #[account(mut, owner = CLMM_PROGRAM_ID)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// CHECK: Deprecated Raydium protocol position.
+    pub protocol_position: UncheckedAccount<'info>,
+
+    /// CHECK: Validated by Raydium.
+    #[account(mut)]
+    pub tick_array_lower: UncheckedAccount<'info>,
+
+    /// CHECK: Validated by Raydium.
+    #[account(mut)]
+    pub tick_array_upper: UncheckedAccount<'info>,
+
+    /// CHECK: Initialized by Raydium.
+    #[account(mut)]
+    pub personal_position: UncheckedAccount<'info>,
+
+    #[account(mut, token::mint = mint_0)]
+    pub pool_vault_0: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(mut, token::mint = mint_1)]
+    pub pool_vault_1: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    pub mint_0: Box<InterfaceAccount<'info, Mint>>,
+    pub mint_1: Box<InterfaceAccount<'info, Mint>>,
+
+    /// CHECK: Validated by Raydium.
+    #[account(mut)]
+    pub bitmap_extension: UncheckedAccount<'info>,
+
+    /// CHECK: Fixed Raydium Devnet program.
+    #[account(address = CLMM_PROGRAM_ID, executable)]
+    pub clmm_program: UncheckedAccount<'info>,
+
+    /// CHECK: Fixed Metaplex program.
+    #[account(
+        address = Pubkey::from_str_const(
+            "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+        ),
+        executable
+    )]
+    pub metadata_program: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, anchor_spl::token::Token>,
+
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>,
+
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+fn decrease_clmm_position<'info>(
+    a: &mut ManageClmmPosition<'info>,
+    liquidity: u128,
+    amount_0_min: u64,
+    amount_1_min: u64,
+) -> Result<()> {
+    use crate::instructions::clmm::*;
+
+    let mint = a.vault.deposit_mint;
+    let bump = [a.vault.bump];
+
+    let seeds: &[&[&[u8]]] = &[&[b"vault", mint.as_ref(), &bump]];
+
+    let (token_0, token_1) = if a.vault_token.mint == a.mint_0.key() {
+        (&a.vault_token, &a.vault_token_b)
+    } else {
+        (&a.vault_token_b, &a.vault_token)
+    };
+
+    require_keys_eq!(token_0.mint, a.mint_0.key());
+    require_keys_eq!(token_1.mint, a.mint_1.key());
+
+    let before_0 = token_0.amount;
+    let before_1 = token_1.amount;
+
+    let token_0_info = token_0.to_account_info();
+    let token_1_info = token_1.to_account_info();
+
+    let infos = vec![
+        a.vault.to_account_info(),
+        a.nft_account.to_account_info(),
+        a.personal_position.to_account_info(),
+        a.pool_state.to_account_info(),
+        a.protocol_position.to_account_info(),
+        a.pool_vault_0.to_account_info(),
+        a.pool_vault_1.to_account_info(),
+        a.tick_array_lower.to_account_info(),
+        a.tick_array_upper.to_account_info(),
+        token_0_info.clone(),
+        token_1_info.clone(),
+        a.token_program.to_account_info(),
+        a.token_program_2022.to_account_info(),
+        a.memo_program.to_account_info(),
+        a.mint_0.to_account_info(),
+        a.mint_1.to_account_info(),
+        a.bitmap_extension.to_account_info(),
+    ];
+
+    let writable = [2usize, 3, 5, 6, 7, 8, 9, 10, 16];
+
+    let metas = infos
+        .iter()
+        .enumerate()
+        .map(|(i, account)| {
+            if writable.contains(&i) {
+                AccountMeta::new(account.key(), i == 0)
+            } else {
+                AccountMeta::new_readonly(account.key(), i == 0)
+            }
+        })
+        .collect();
+
+    invoke_clmm(
+        a.clmm_program.to_account_info(),
+        &infos,
+        metas,
+        decrease_liquidity_data(liquidity, amount_0_min, amount_1_min),
+        seeds,
+    )?;
+
+    let after_0 = TokenAccount::try_deserialize(&mut &token_0_info.try_borrow_data()?[..])?.amount;
+
+    let after_1 = TokenAccount::try_deserialize(&mut &token_1_info.try_borrow_data()?[..])?.amount;
+
+    let received_0 = after_0
+        .checked_sub(before_0)
+        .ok_or(VaultError::MathOverflow)?;
+
+    let received_1 = after_1
+        .checked_sub(before_1)
+        .ok_or(VaultError::MathOverflow)?;
+
+    require!(
+        received_0 >= amount_0_min && received_1 >= amount_1_min,
+        VaultError::SlippageExceeded
+    );
+
+    msg!("Token 0 received: {}", received_0);
+    msg!("Token 1 received: {}", received_1);
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct ManageClmmPosition<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", vault.deposit_mint.as_ref()],
+        bump = vault.bump,
+        has_one = admin @ VaultError::NotAdmin,
+        has_one = vault_token
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+
+    #[account(
+        mut,
+        seeds = [b"clmm_position", vault.key().as_ref()],
+        bump = clmm_position.bump,
+        has_one = vault,
+        has_one = nft_mint,
+        has_one = personal_position,
+        constraint = clmm_position.pool == pool_state.key()
+            @ VaultError::InvalidClmmAccount
+    )]
+    pub clmm_position: Box<Account<'info, instructions::clmm::ClmmPosition>>,
+
+    #[account(
+        mut,
+        token::authority = vault,
+        token::token_program = token_program
+    )]
+    pub vault_token: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [b"vault_token_b", vault.key().as_ref()],
+        bump,
+        token::authority = vault,
+        token::token_program = token_program
+    )]
+    pub vault_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(mut)]
+    pub nft_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    #[account(
+        mut,
+        token::mint = nft_mint,
+        token::authority = vault,
+        token::token_program = token_program,
+        constraint = nft_account.amount == 1
+            @ VaultError::InvalidClmmAccount
+    )]
+    pub nft_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// CHECK: Stored Raydium personal position.
+    #[account(mut, owner = CLMM_PROGRAM_ID)]
+    pub personal_position: UncheckedAccount<'info>,
+
+    /// CHECK: Stored Raydium pool.
+    #[account(mut, owner = CLMM_PROGRAM_ID)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// CHECK: Deprecated protocol position.
+    pub protocol_position: UncheckedAccount<'info>,
+
+    /// CHECK: Validated by Raydium.
+    #[account(mut)]
+    pub tick_array_lower: UncheckedAccount<'info>,
+
+    /// CHECK: Validated by Raydium.
+    #[account(mut)]
+    pub tick_array_upper: UncheckedAccount<'info>,
+
+    #[account(mut, token::mint = mint_0)]
+    pub pool_vault_0: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    #[account(mut, token::mint = mint_1)]
+    pub pool_vault_1: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    pub mint_0: Box<InterfaceAccount<'info, Mint>>,
+    pub mint_1: Box<InterfaceAccount<'info, Mint>>,
+
+    /// CHECK: Validated by Raydium.
+    #[account(mut)]
+    pub bitmap_extension: UncheckedAccount<'info>,
+
+    /// CHECK: Fixed Raydium program.
+    #[account(address = CLMM_PROGRAM_ID, executable)]
+    pub clmm_program: UncheckedAccount<'info>,
+
+    /// CHECK: Fixed SPL Memo program.
+    #[account(
+        address = Pubkey::from_str_const(
+            "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+        ),
+        executable
+    )]
+    pub memo_program: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, anchor_spl::token::Token>,
+
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+
+    pub system_program: Program<'info, System>,
 }

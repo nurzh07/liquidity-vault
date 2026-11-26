@@ -157,3 +157,22 @@ Close an out-of-range position:
 
 The core CLMM position lifecycle and rebalancing
 workflow were successfully demonstrated on Devnet.
+
+## Final Devnet verification
+
+```text
+PASS: Deposit blocked during CLMM
+PASS: Withdraw blocked during CLMM
+PASS: Unauthorized collect rejected
+PASS: Unauthorized close rejected
+Transaction: 2jALW4MCjBCAucaiCUYLZFgfqQTyygcdgdPAPL3iGh3daRKcabcPv5teVsnQn78a9qsSKcSbgi7jS38xaWH3onr
+Transaction: 3hBmCHNH6aTXh38QJ4wXcAm2Bvt9jMEDro5m2QgAZsYjaVpPNQLHNvUh1z8HfNHpVxcbpcam452vQEsYoeTRvUzA
+PASS: Deposit blocked while Token B exists
+PASS: Withdraw blocked while Token B exists
+PASS: Token B fully converted
+PASS: Withdraw simulation
+PASS: Withdraw simulation
+PASS: Real withdrawal
+Transaction: rGwdDHiFn1PpMdhvS1p8zYVUdVgf1aYunZDew7T1BdV7dt4D4tE9LMkDrMjL6anUtNL2bgnr4jdizFf64P77wct
+ ALL SCRIPT CHECKS COMPLETED
+```

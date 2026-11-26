@@ -130,7 +130,7 @@ async function main() {
 
   if (MODE === "status") return;
 
-  if (!["open", "collect", "close"].includes(MODE)) {
+  if (!["open", "collect", "close", "price"].includes(MODE)) {
     throw new Error("Unknown MODE");
   }
 
@@ -139,7 +139,7 @@ async function main() {
   );
 
   const poolId = new PublicKey(
-    MODE === "open"
+    (MODE === "open" || MODE === "price")
       ? poolFile.poolId
       : state?.pool
   );
@@ -194,6 +194,24 @@ async function main() {
     !Number.isInteger(currentTick)
   ) {
     throw new Error("Invalid tick information");
+  }
+
+
+  if (MODE === "price") {
+    console.log("Pool price:", poolInfo.price);
+    console.log("Current tick:", currentTick);
+
+    if (state?.active) {
+      const inRange =
+        currentTick >= state.tickLower &&
+        currentTick < state.tickUpper;
+
+      console.log("Lower tick:", state.tickLower);
+      console.log("Upper tick:", state.tickUpper);
+      console.log("In range:", inRange);
+    }
+
+    return;
   }
 
   const bitmapExtension = getPdaExBitmapAccount(
@@ -419,10 +437,32 @@ async function main() {
     .signers(signers);
 
   if (process.env.SEND !== "1") {
-    const result = await builder.simulate();
+    const tx = await builder.transaction();
+
+    const bh = await connection.getLatestBlockhash(
+      "confirmed"
+    );
+
+    tx.feePayer = owner.publicKey;
+    tx.recentBlockhash = bh.blockhash;
+
+    tx.sign(owner, ...signers);
+
+    const result = await connection.simulateTransaction(
+      tx
+    );
+
+    for (const log of result.value.logs ?? []) {
+      console.log(log);
+    }
+
+    if (result.value.err) {
+      throw new Error(
+        JSON.stringify(result.value.err)
+      );
+    }
 
     console.log("Simulation successful");
-    console.log(result);
     console.log("No transaction submitted");
 
     return;
